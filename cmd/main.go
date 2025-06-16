@@ -1,7 +1,6 @@
 package main
 
 import (
-	// "context"
 	"flag"
 	"log"
 	"os"
@@ -23,24 +22,29 @@ func main() {
 		log.Fatal("Error loading config:", err)
 	}
 
-	// Initialize logger
-	logger, err := logger.New()
+	// Initialize custom logger
+	clog, err := logger.New(cfg.LogLevel)
 	if err != nil {
-		log.Fatal("failed to initialize logger:", err)
+		log.Fatal("failed to initialize clog:", err)
 	}
-	defer logger.Sync()
+	defer func(clog logger.Logger) {
+		err := clog.Sync()
+		if err != nil {
+			log.Fatal("failed to sync custom logger:", err)
+		}
+	}(clog)
 
-	logger.Infof("Starting application on port %d", cfg.AppPort)
+	clog.Infof("Starting application on port %d", cfg.AppPort)
 
 	// Set up Kafka producer
-	producer := kafka.NewProducer([]string{cfg.KafkaHost}, cfg.KafkaTopic, logger)
+	producer := kafka.NewProducer([]string{cfg.KafkaHost}, cfg.KafkaTopic, clog)
 	if producer == nil {
-		logger.Errorf("Failed to initialize Kafka producer")
+		clog.Errorf("Failed to initialize Kafka producer")
 		return
 	}
 	defer func() {
 		if err := producer.Close(); err != nil {
-			logger.Errorf("Failed to close Kafka producer: %v", err)
+			clog.Errorf("Failed to close Kafka producer: %v", err)
 		}
 	}()
 
@@ -52,9 +56,9 @@ func main() {
 	// Initialize scrapers
 	var scraper scrapers.Scraper
 	if *only == "kaspi" {
-		scraper = scrapers.NewKaspiScraper(producer, logger)
+		scraper = scrapers.NewKaspiScraper(scrapers.DefaultKaspiConfig(), producer, clog)
 	} else {
-		logger.Errorf("Unsupported marketplace: %s", *only)
+		clog.Errorf("Unsupported marketplace: %s", *only)
 	}
 
 	// ctx, cancel := context.WithCancel(context.Background())
@@ -65,28 +69,28 @@ func main() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
-		logger.Infof("Shutting down gracefully...")
+		clog.Infof("Shutting down gracefully...")
 		// cancel()
 
 		// Force shutdown after timeout
 		time.Sleep(10 * time.Second)
-		logger.Infof("Forced shutdown after timeout")
+		clog.Infof("Forced shutdown after timeout")
 		os.Exit(1)
 	}()
 
-	// Start scraping process
+	// Start the scraping process
 	if *once {
 		count, err := scraper.Scrape()
 		if err != nil {
-			logger.Errorf("Error scraping products: %v", err)
+			clog.Errorf("Error scraping products: %v", err)
 			return
 		}
 
-		logger.Infof("Scraped %d products", count)
-		logger.Infof("One-time scraping completed, shutting down...")
+		clog.Infof("Scraped %d products", count)
+		clog.Infof("One-time scraping completed, shutting down...")
 		return
 	} else {
-		// Set up cron job for periodic scraping
+		// Set up the cron job for periodic scraping
 		// scrapers.RunParsers(ctx, cfg, *only)
 		// c := cron.New()
 		// c.AddFunc(cfg.SchedulerSpec, run)

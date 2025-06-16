@@ -21,7 +21,7 @@ services:
     depends_on:
       - zookeeper
     ports:
-      - 29092:29092
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -61,7 +61,7 @@ services:
     environment:
       - KAFKA_HOST=kafka:9092
       - KAFKA_TOPIC=products.raw
-      - LOG_LEVEL=info
+      - LOG_LEVEL=debug
       - TIMEOUT=30s
       - ENABLE_KASPI=true
       - ENABLE_OZON=false
