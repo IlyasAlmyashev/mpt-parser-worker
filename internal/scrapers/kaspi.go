@@ -3,6 +3,7 @@ package scrapers
 import (
 	"compress/flate"
 	"compress/gzip"
+	"strings"
 
 	"context"
 	"encoding/json"
@@ -50,81 +51,109 @@ func NewKaspiScraper(cfg KaspiScraperConfig, producer kafka.Producer, logger log
 
 // Scrape performs the main scraping process.
 func (s *KaspiScraper) Scrape() (int64, error) {
-	s.logger.Infof("Starting Kaspi scraping...")
+	s.logger.Infof("Starting Kaspi scraping for category %s...", s.cfg.Category)
 
 	// Create a root context with timeout for the entire scrape.
 	rootCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// Prepare a channel for page tasks.
-	pagesCh := make(chan int, s.cfg.MaxPages)
+	// Extract brands from the category page
+	brands, err := s.extractBrands()
+	if err != nil {
+		s.logger.Errorf("Failed to extract brands: %v", err)
+		return 0, fmt.Errorf("failed to extract brands: %w", err)
+	}
 
-	// Fill page numbers.
+	// Prepare a channel for brand tasks.
+	brandsCh := make(chan string, len(brands))
+
+	// Fill brands channel.
 	go func() {
-		defer close(pagesCh)
-		for page := 1; page <= s.cfg.MaxPages; page++ {
-			pagesCh <- page
+		defer close(brandsCh)
+		for _, brand := range brands {
+			brandsCh <- brand
 		}
 	}()
 
-	// We will count total products across all pages.
+	// We will count total products across all brands.
 	var totalCount int64
 
-	// Worker function.
-	workerFn := func(ctx context.Context, page int) error {
-		s.logger.Infof("Worker started for page: %d", page)
+	// Worker function for processing brands.
+	workerFn := func(ctx context.Context, brand string) error {
+		s.logger.Infof("Worker started for brand: %s", brand)
 
-		// Build the URL for this page.
-		// urlStr := s.buildURL(s.cfg.Category, s.cfg.City, page, reqID)
-		urlStr := s.buildURL(s.cfg.Category, s.cfg.City, page, "")
+		// Process pages for this brand until we hit a page with no products
+		for page := 0; page < s.cfg.MaxPages; page++ {
+			// Build the URL for this page and brand
+			urlStr := s.buildURL(s.cfg.Category, s.cfg.City, page, "", brand)
 
-		// Retry fetch logic.
-		var pageData []byte
-		retryErr := Retry(ctx, s.cfg.Retry, func() error {
-			b, err := s.fetchProductsPage(ctx, urlStr)
-			if err != nil {
-				s.logger.Warnf("Retry warning: fetch failed for page %d: %v", page, err)
-				return err
+			// Retry fetch logic.
+			var pageData []byte
+			retryErr := Retry(ctx, s.cfg.Retry, func() error {
+				b, err := s.fetchProductsPage(ctx, urlStr)
+				if err != nil {
+					s.logger.Warnf("Retry warning: fetch failed for brand %s, page %d: %v", brand, page, err)
+					return err
+				}
+				pageData = b
+				return nil
+			})
+
+			if retryErr != nil {
+				// All retry attempts failed.
+				s.logger.Errorf("All retries failed for brand %s, page %d: %v", brand, page, retryErr)
+
+				// If it's a network error or 5xx, we stop this brand
+				if errors.Is(retryErr, context.DeadlineExceeded) ||
+					strings.Contains(retryErr.Error(), "5") {
+					return fmt.Errorf("failed to fetch brand %s: %w", brand, retryErr)
+				}
+
+				// If it's a client error (4xx), we stop this brand but don't report error
+				if strings.Contains(retryErr.Error(), "4") {
+					s.logger.Infof("Stopping brand %s due to client error", brand)
+					return nil
+				}
+
+				// For other errors, we just continue to the next page
+				continue
 			}
-			pageData = b
-			return nil
-		})
 
-		if retryErr != nil {
-			// All retry attempts failed.
-			s.logger.Errorf("All retries failed for page %d: %v", page, retryErr)
-			return retryErr
+			// Parse JSON into a slice of ProductRaw.
+			products, err := s.ParseKaspiProductsFromJSON(pageData)
+			if err != nil {
+				s.logger.Errorf("Failed to parse JSON for brand %s, page %d: %v", brand, page, err)
+				continue
+			}
+
+			// If no products found, stop processing this brand
+			if len(products) == 0 {
+				s.logger.Infof("No more products for brand %s after page %d", brand, page)
+				break
+			}
+
+			// Send a batch of products to Kafka.
+			if err := s.producer.SendBatch(products); err != nil {
+				s.logger.Errorf("Failed to send batch to Kafka for brand %s, page %d: %v", brand, page, err)
+				continue
+			}
+
+			// Accumulate total count.
+			atomic.AddInt64(&totalCount, int64(len(products)))
+
+			s.logger.Infof("Successfully processed brand %s, page %d, products: %d", brand, page, len(products))
+
+			// Sleep a bit to avoid rate limiting
+			// time.Sleep(100 * time.Millisecond)
 		}
 
-		// Parse JSON into a slice of ProductRaw.
-		products, err := s.ParseKaspiProductsFromJSON(pageData)
-		if err != nil {
-			s.logger.Errorf("Failed to parse JSON for page %d: %v", page, err)
-			return err
-		}
-
-		// If no products found, signal that no more pages exist.
-		if len(products) == 0 {
-			s.logger.Infof("No products on page %d, stopping further processing", page)
-			return ErrNoMoreProducts
-		}
-
-		// Send a batch of products to Kafka.
-		if err := s.producer.SendBatch(products); err != nil {
-			s.logger.Errorf("Failed to send batch to Kafka for page %d: %v", page, err)
-			return err
-		}
-
-		// Accumulate total count.
-		atomic.AddInt64(&totalCount, int64(len(products)))
-
-		s.logger.Infof("Successfully processed page %d, products: %d", page, len(products))
+		s.logger.Infof("Completed processing brand: %s", brand)
 		return nil
 	}
 
 	// Start a worker pool.
-	err := StartWorkerPool(rootCtx, pagesCh, s.cfg.WorkerCount, workerFn)
-	if err != nil && !errors.Is(err, ErrNoMoreProducts) {
+	err = StartWorkerPool(rootCtx, brandsCh, s.cfg.WorkerCount, workerFn)
+	if err != nil {
 		s.logger.Errorf("Worker pool error: %v", err)
 		return totalCount, err
 	}
@@ -133,20 +162,19 @@ func (s *KaspiScraper) Scrape() (int64, error) {
 	return totalCount, nil
 }
 
-// gets a session-specific requestID from Kaspi using chromedp.
-func (s *KaspiScraper) getRequestID() (string, error) {
-	s.logger.Infof("Trying to get requestID...")
-	kaspiUrl := "https://kaspi.kz/shop/c/smartphones/"
+// extractBrands extracts the list of brand names from Kaspi's category page.
+func (s *KaspiScraper) extractBrands() ([]string, error) {
+	s.logger.Infof("Extracting available brands for category %s...", s.cfg.Category)
+	categoryURL := fmt.Sprintf("https://kaspi.kz/shop/c/%s/", s.cfg.Category)
 
-	req, _ := http.NewRequest("GET", kaspiUrl, nil)
+	req, _ := http.NewRequest("GET", categoryURL, nil)
 
 	req.Header.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	// req.Header.Add("Accept-Encoding", "gzip, deflate, br, zstd")
 	req.Header.Add("Accept-Language", "en-US,en;q=0.6")
 	req.Header.Add("Connection", "keep-alive")
-	req.Header.Add("Cookie", "ks.tg=93; k_stat=a85552eb-8baf-4354-a8cf-2bc8843b864d; kaspi.storefront.cookie.city=750000000")
+	req.Header.Add("Cookie", fmt.Sprintf("ks.tg=93; k_stat=a85552eb-8baf-4354-a8cf-2bc8843b864d; kaspi.storefront.cookie.city=%d", s.cfg.City))
 	req.Header.Add("Host", "kaspi.kz")
-	req.Header.Add("Referer", "https://kaspi.kz/shop/c/smartphones/")
+	// req.Header.Add("Referer", "https://kaspi.kz/shop/c/smartphones/")
 	req.Header.Add("sec-ch-ua", `"Brave";v="137", "Chromium";v="137", "Not/A)Brand";v="24"`)
 	req.Header.Add("sec-ch-ua-platform", `"Windows"`)
 	req.Header.Add("sec-ch-ua-mobile", "?0")
@@ -161,7 +189,7 @@ func (s *KaspiScraper) getRequestID() (string, error) {
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		s.logger.Errorf("Failed to load category page: %v", err)
-		return "", fmt.Errorf("failed to load category page: %w", err)
+		return nil, fmt.Errorf("failed to load category page: %w", err)
 	}
 
 	defer func(Body io.ReadCloser) {
@@ -170,42 +198,77 @@ func (s *KaspiScraper) getRequestID() (string, error) {
 			s.logger.Errorf("Failed to close response body: %v", err)
 		}
 	}(res.Body)
-	body, _ := io.ReadAll(res.Body)
 
-	var requestID string
-
-	// Try to find queryID in the HTML if not found in network requests
-	re := regexp.MustCompile(`"queryID":"([^"]+)"`)
-	if matches := re.FindStringSubmatch(string(body)); len(matches) > 1 {
-		fmt.Println("Found queryID in HTML:", matches)
-		requestID = matches[1]
-		s.logger.Infof("Found queryID: %s", requestID)
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	if requestID == "" {
-		//s.logger.Debugf("Page HTML content: %s", pageHTML)
-		return "", errors.New("failed to locate queryID in page HTML or network requests")
+	// Find the filter JSON in the HTML
+	re := regexp.MustCompile(`"id"\s*:\s*"manufacturerName".*?"rows"\s*:\s*(\[[\s\S]*?\])`)
+	matches := re.FindSubmatch(body)
+	if len(matches) < 1 {
+		return nil, errors.New("filters data not found in HTML")
 	}
 
-	s.logger.Debugf("Successfully extracted requestID: %s", requestID)
-	return requestID, nil
+	brandsJSON := matches[1]
+
+	type Brand struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	var brands []Brand
+	if err := json.Unmarshal([]byte(brandsJSON), &brands); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal brands: %w", err)
+	}
+
+	if len(brands) == 0 {
+		return nil, errors.New("no brands found in filters")
+	}
+
+	// Convert []Brand to []string containing only brand names
+	brandNames := make([]string, len(brands))
+	for i, brand := range brands {
+		brandNames[i] = brand.Name
+	}
+
+	s.logger.Infof("Found %d brands: %v", len(brandNames), brandNames)
+	return brandNames, nil
 }
 
 // buildURL constructs the URL to fetch products from the Kaspi API or page.
-func (s *KaspiScraper) buildURL(category string, city int, page int, requestID string) string {
+func (s *KaspiScraper) buildURL(category string, city int, page int, requestID string, brand string) string {
 	base := "https://kaspi.kz/yml/product-view/pl/results"
 
 	// Construct the 'q' parameter with "Magnum_ZONE1" suffix.
 	qValue := ":category:" + category + ":availableInZones:Magnum_ZONE1"
 	escapedQ := url.QueryEscape(qValue)
 
+	// Add text parameter for brand filtering
+	textParam := ""
+	if brand != "" {
+		textParam = "&text=" + url.QueryEscape(strings.ToLower(brand))
+	} else {
+		textParam = "&text"
+	}
+
+	// Add requestID parameter
+	requestIDParam := ""
+	if requestID != "" {
+		requestIDParam = "&requestId=" + requestID
+	} else {
+		requestIDParam = "&requestId"
+	}
+
 	// Assemble the query string:
 	resulUrl := fmt.Sprintf(
-		"%s?page=%d&q=%s&text&sort=relevance&qs&requestId=%s&ui=d&i=-1&c=%d",
+		"%s?page=%d&q=%s%s&sort=relevance&qs%s&ui=d&i=-1&c=%d",
 		base,
 		page,
 		escapedQ,
-		requestID,
+		textParam,
+		requestIDParam,
 		city,
 	)
 	s.logger.Debugf("URL built: %s", resulUrl)
