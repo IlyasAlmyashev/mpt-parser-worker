@@ -9,8 +9,8 @@ import (
 // KaspiScraperConfig holds Kaspi scraper configuration.
 type KaspiScraperConfig struct {
 	Category    string      // e.g. "smartphones"
-	City        int         // e.g. 750000000
-	MaxPages    int         // upper limit for pages
+	City        int         // e.g. 750000000 (Almaty)
+	MaxPages    int         // upper limit for pages (300 pages limit is set by Kaspi API)
 	WorkerCount int         // default = runtime.NumCPU()
 	Retry       RetryConfig // retry config
 }

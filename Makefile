@@ -10,7 +10,7 @@ build:
 
 # Run the application
 run:
-	go run $(MAIN_FILE)
+	go run $(MAIN_FILE) --once --only=kaspi
 
 # Run once with Kaspi only
 run-once-kaspi:

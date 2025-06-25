@@ -3,8 +3,11 @@ package logger
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -16,12 +19,21 @@ type Logger interface {
 	Infof(template string, args ...interface{})
 	Warnf(template string, args ...interface{})
 	Errorf(template string, args ...interface{})
-	Sync() error
+	Fatalf(template string, args ...interface{})
+	Close() error
 }
 
 type zapLogger struct {
-	logger *zap.SugaredLogger
-	syncFn func() error
+	logger  *zap.SugaredLogger
+	syncFn  func() error
+	closers []func() error // Список функций закрытия
+	mu      sync.Mutex     // Мьютекс для безопасного доступа к closers
+}
+
+// generateLogFileName создает имя файла для логов с временной меткой.
+func generateLogFileName() string {
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	return filepath.Join("logs", fmt.Sprintf("app_%s.log", timestamp))
 }
 
 // New creates a new logger with the specified log level.
@@ -47,37 +59,40 @@ func New(logLevel string) (Logger, error) {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	// Create custom console encoder for Windows
+	// Create a custom console encoder for Windows
 	consoleEncoder := zapcore.NewConsoleEncoder(encoderConfig)
 
-	// Setup output syncer
+	// Настраиваем вывод
 	var outputPaths []string
+	var writers []zapcore.WriteSyncer
+	var closers []func() error
+
+	// Всегда добавляем stdout
+	writers = append(writers, zapcore.AddSync(os.Stdout))
+
+	// Setup output syncer
 	if runtime.GOOS == "windows" {
 		// Use file output on Windows to avoid console sync issues
-		outputPaths = []string{"logs/app.log", "stdout"}
-		// Create logs directory if it doesn't exist
-		if err := os.MkdirAll("logs", 0755); err != nil {
+		// outputPaths = []string{"logs/app.log", "stdout"}
+		// Create a logs directory if it doesn't exist
+		if err := os.MkdirAll("logs", 0750); err != nil {
 			return nil, fmt.Errorf("failed to create logs directory: %w", err)
 		}
-	} else {
-		outputPaths = []string{"stdout"}
-	}
 
-	// Create writers for each output path
-	var writers []zapcore.WriteSyncer
-	for _, path := range outputPaths {
-		if path == "stdout" {
-			writers = append(writers, zapcore.AddSync(os.Stdout))
-		} else {
-			file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open log file: %w", err)
-			}
-			writers = append(writers, zapcore.AddSync(file))
+		// Генерируем имя файла с временной меткой
+		logFileName := generateLogFileName()
+		outputPaths = append(outputPaths, logFileName)
+
+		file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open log file: %w", err)
 		}
+
+		writers = append(writers, zapcore.AddSync(file))
+		closers = append(closers, file.Close) // Сохраняем функцию закрытия файла
 	}
 
-	// Create core with multiple outputs
+	// Create a core with multiple outputs
 	core := zapcore.NewTee(
 		zapcore.NewCore(
 			consoleEncoder,
@@ -100,13 +115,12 @@ func New(logLevel string) (Logger, error) {
 	return &zapLogger{
 		logger: sugar,
 		syncFn: func() error {
-			if runtime.GOOS == "windows" {
-				// Ignore sync errors on Windows
-				_ = sugar.Sync()
-				return nil
-			}
-			return sugar.Sync()
+			// Sync всегда возвращает успех, но внутренне пытается выполнить синхронизацию
+			// Это предотвращает ошибки на Windows
+			_ = sugar.Sync()
+			return nil
 		},
+		closers: closers,
 	}, nil
 }
 
@@ -126,11 +140,33 @@ func (l *zapLogger) Errorf(template string, args ...interface{}) {
 	l.logger.Errorf(template, args...)
 }
 
-func (l *zapLogger) Sync() error {
-	return l.syncFn()
+func (l *zapLogger) Fatalf(template string, args ...interface{}) {
+	l.logger.Fatalf(template, args...)
 }
 
-// parseLogLevel converts a string level to zapcore.Level
+// Close закрывает все ресурсы логгера, включая файловые дескрипторы.
+func (l *zapLogger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Сначала синхронизируем буферы
+	_ = l.syncFn()
+
+	// Затем закрываем все файлы
+	var lastErr error
+	for _, closer := range l.closers {
+		if err := closer(); err != nil {
+			lastErr = err // Сохраняем последнюю ошибку
+		}
+	}
+
+	// Очищаем список закрывающих функций
+	l.closers = nil
+
+	return lastErr
+}
+
+// parseLogLevel converts a string level to zapcore.Level.
 func parseLogLevel(level string) (zapcore.Level, error) {
 	switch strings.ToLower(level) {
 	case "debug":

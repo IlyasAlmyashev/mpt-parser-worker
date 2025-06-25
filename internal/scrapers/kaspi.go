@@ -29,11 +29,22 @@ type Scraper interface {
 	Scrape() (int64, error)
 }
 
+const (
+	// brandFilterPattern matches the manufacturer filter data in HTML response
+	brandFilterPattern = `"id"\s*:\s*"manufacturerName".*?"rows"\s*:\s*(\[[\s\S]*?\])`
+)
+
 // KaspiScraper implements the Scraper interface.
 type KaspiScraper struct {
 	cfg      KaspiScraperConfig
 	producer kafka.Producer
 	logger   logger.Logger
+}
+
+// BrandFilter represents the manufacturer filter data structure
+type BrandFilter struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 // NewKaspiScraper constructs a new KaspiScraper.
@@ -120,7 +131,7 @@ func (s *KaspiScraper) Scrape() (int64, error) {
 			}
 
 			// Parse JSON into a slice of ProductRaw.
-			products, err := s.ParseKaspiProductsFromJSON(pageData)
+			products, err := s.parseKaspiProductsFromJSON(pageData)
 			if err != nil {
 				s.logger.Errorf("Failed to parse JSON for brand %s, page %d: %v", brand, page, err)
 				continue
@@ -205,36 +216,39 @@ func (s *KaspiScraper) extractBrands() ([]string, error) {
 	}
 
 	// Find the filter JSON in the HTML
-	re := regexp.MustCompile(`"id"\s*:\s*"manufacturerName".*?"rows"\s*:\s*(\[[\s\S]*?\])`)
-	matches := re.FindSubmatch(body)
-	if len(matches) < 1 {
-		return nil, errors.New("filters data not found in HTML")
+	brandFilters, err := s.parseBrandFilters(body)
+	if err != nil {
+		return nil, err
 	}
 
-	brandsJSON := matches[1]
-
-	type Brand struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	}
-
-	var brands []Brand
-	if err := json.Unmarshal([]byte(brandsJSON), &brands); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal brands: %w", err)
-	}
-
-	if len(brands) == 0 {
-		return nil, errors.New("no brands found in filters")
-	}
-
-	// Convert []Brand to []string containing only brand names
-	brandNames := make([]string, len(brands))
-	for i, brand := range brands {
+	// Convert []BrandFilter to []string containing only brand names
+	brandNames := make([]string, len(brandFilters))
+	for i, brand := range brandFilters {
 		brandNames[i] = brand.Name
 	}
 
-	s.logger.Infof("Found %d brands: %v", len(brandNames), brandNames)
+	s.logger.Infof("Found %d brands in cathegory %s", len(brandNames), s.cfg.Category)
 	return brandNames, nil
+}
+
+// parseBrandFilters extracts and parses brand filters from HTML content
+func (s *KaspiScraper) parseBrandFilters(htmlContent []byte) ([]BrandFilter, error) {
+	filterRegex := regexp.MustCompile(brandFilterPattern)
+	matches := filterRegex.FindSubmatch(htmlContent)
+	if len(matches) < 2 {
+		return nil, errors.New("filters data not found in HTML")
+	}
+
+	var brandFilters []BrandFilter
+	if err := json.Unmarshal(matches[1], &brandFilters); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal brands: %w", err)
+	}
+
+	if len(brandFilters) == 0 {
+		return nil, errors.New("no brands found in filters")
+	}
+
+	return brandFilters, nil
 }
 
 // buildURL constructs the URL to fetch products from the Kaspi API or page.
@@ -370,8 +384,8 @@ func (s *KaspiScraper) fetchProductsPage(ctx context.Context, urlStr string) ([]
 	return data, nil
 }
 
-// ParseKaspiProductsFromJSON deserializes the JSON into []model.ProductRaw.
-func (s *KaspiScraper) ParseKaspiProductsFromJSON(data []byte) ([]model.ProductRaw, error) {
+// parseKaspiProductsFromJSON deserializes the JSON into []model.ProductRaw.
+func (s *KaspiScraper) parseKaspiProductsFromJSON(data []byte) ([]model.ProductRaw, error) {
 
 	// First, try to parse the root response structure
 	var response struct {
@@ -400,7 +414,7 @@ func (s *KaspiScraper) ParseKaspiProductsFromJSON(data []byte) ([]model.ProductR
 			Title:       result.Title,
 			Price:       result.Price,
 			URL:         "https://kaspi.kz/shop" + result.ShopLink,
-			Marketplace: "Kaspi",
+			Marketplace: "kaspi",
 			Category:    s.cfg.Category,
 			Timestamp:   time.Now(),
 		}
